@@ -1,73 +1,74 @@
-# src/ml_model.py
-
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from sklearn.ensemble import RandomForestRegressor
+from typing import Optional, Tuple
 
-class MuSigmaPredictor:
-    def __init__(self, window=20):
-        self.window = window
-        self.mu_model = RandomForestRegressor(n_estimators=100, random_state=42)
 
-    def _compute_features(self, close: pd.Series):
-        """Compute rolling mean and std as features for the last day."""
-        if len(close) < self.window:
-            raise ValueError(f"Close series too short for window={self.window}")
-        ma = float(close.rolling(window=self.window).mean().iloc[-1])
-        std = float(close.rolling(window=self.window).std().iloc[-1])
-        features = np.array([[ma, std]])  # shape (1,2) for sklearn
-        return features
+class QuantVolatilityPredictor:
+    """
+    Quant-grade predictor for drift (mu) and volatility (sigma) for Monte Carlo simulations.
 
-    def train(self, ticker: str, period="5y"):
-        """Train mu model using historical stock data with log returns."""
+    - sigma is estimated via EWMA of log returns (annualized)
+    - mu is blended between long-term mean and recent EWMA
+    """
+
+    def __init__(self, ewma_span: int = 60, recent_weight: float = 0.7):
+        """
+        Parameters:
+        ewma_span: span for EWMA volatility
+        recent_weight: weight given to recent EWMA drift vs long-term mean
+        """
+        self.ewma_span = ewma_span
+        self.recent_weight = recent_weight
+        self.sigma_series: Optional[pd.Series] = None
+        self.fitted = False
+
+    @staticmethod
+    def _log_returns(close: pd.Series) -> pd.Series:
+        """Compute log returns from price series"""
+        close = close.dropna()
+        return np.log(close / close.shift(1)).dropna()
+
+    def fit(self, close: pd.Series):
+        """
+        Fit the EWMA volatility series.
+        """
+        log_returns = self._log_returns(close)
+
+        # EWMA volatility, annualized
+        self.sigma_series = log_returns.ewm(span=self.ewma_span, adjust=False).std()
+        self.sigma_series *= np.sqrt(252)
+
+        self.fitted = True
+
+    def predict(self, close: pd.Series) -> Tuple[float, float]:
+        """
+        Return (mu, sigma) for next-step Monte Carlo simulation.
+        mu: blended drift (annualized)
+        sigma: annualized volatility
+
+        Uses:
+        - long-term mean of log returns
+        - recent EWMA of log returns
+        """
+        if not self.fitted:
+            raise ValueError("Model not fitted. Call fit(close) first.")
+
+        log_returns = self._log_returns(close)
+        long_term_mu = float(log_returns.mean().item() * 252)  # annualized
+
+        # Recent EWMA drift
+        recent_mu_ewma = float(log_returns.ewm(span=self.ewma_span, adjust=False).mean().iloc[-1].item() * 252)
+
+        mu = self.recent_weight * recent_mu_ewma + (1 - self.recent_weight) * long_term_mu
+
+        # Sigma from EWMA series
+        sigma = float(self.sigma_series.dropna().iloc[-1].item())
+
+        return mu, sigma
+
+    def fit_from_ticker(self, ticker: str, period: str = "10y"):
+        """Download prices and fit EWMA volatility"""
         df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
         close = df["Close"].dropna()
-
-        if len(close) < self.window + 1:
-            raise ValueError(f"Not enough data to compute features (need at least {self.window + 1} days).")
-
-        # Compute log returns
-        log_returns = np.log(close / close.shift(1)).dropna()
-
-        # Compute rolling features
-        ma_series = close.rolling(window=self.window).mean()
-        std_series = close.rolling(window=self.window).std()
-
-        # Align features with log returns
-        aligned_index = ma_series.index[self.window - 1:]
-        ma_aligned = ma_series.loc[aligned_index]
-        std_aligned = std_series.loc[aligned_index]
-        returns_aligned = log_returns.loc[aligned_index]
-
-        # Drop NaNs
-        valid_mask = (~ma_aligned.isna()) & (~std_aligned.isna()) & (~returns_aligned.isna())
-        ma_final = ma_aligned[valid_mask]
-        std_final = std_aligned[valid_mask]
-        returns_final = returns_aligned[valid_mask]
-
-        X = np.column_stack((ma_final.values, std_final.values))
-        y_mu = returns_final.values.ravel()  # 1D target
-
-        # Sanity check
-        if len(X) != len(y_mu):
-            raise ValueError(f"X and y lengths do not match! {len(X)} vs {len(y_mu)}")
-
-        # Train mu model
-        self.mu_model.fit(X, y_mu)
-
-        # Compute realistic sigma as rolling std of log returns
-        self.sigma_series = log_returns.rolling(window=self.window).std().dropna()
-
-    def predict(self, close: pd.Series):
-        """Predict mu using ML, and sigma using rolling volatility (log returns)."""
-        # ML-predicted mu
-        features = self._compute_features(close)
-        mu_pred = self.mu_model.predict(features)[0]
-
-        # Sigma: last available rolling volatility of log returns
-        if len(self.sigma_series) == 0:
-            raise ValueError("Sigma series is empty. Train the model first.")
-        sigma_pred = float(self.sigma_series.iloc[-1])
-
-        return mu_pred, sigma_pred
+        self.fit(close)
